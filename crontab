@@ -1,0 +1,3 @@
+# Backup minecraft every hour
+0 * * * * { echo -n "Start of backup: "; date; for pid in $(/usr/sbin/pidof -x minecraft-server-daemon); do kill -USR1 $pid; done; echo -n "End of backup: "; date; } 2>&1 >> ~/minecraft/cron.log
+0 4 * * * { echo -n "Start of purge: "; date; for pid in $(/usr/sbin/pidof -x minecraft-server-daemon); do kill -USR2 $pid; done; echo -n "End of purge: "; date; } 2>&1 >> ~/minecraft/cron.log

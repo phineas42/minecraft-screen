@@ -1,0 +1,181 @@
+#!/usr/bin/sh
+CONFDIR=~/minecraft/servers.d
+TMPDIRP=~/minecraft/tmp
+BACKUPDIR=~/minecraft/backups
+DIFFERENTIALS=167
+SCREENNAME=minecraft-server
+LEVEL0RETENTIONDAYS=366
+LEVEL1RETENTIONDAYS=90
+##################
+# Defaults:
+MAXHEAP=8192
+MINHEAP=8192
+OPTIONS=nogui
+PROGRAM=minecraft_server.jar
+##################
+set -x
+SCREEN=screen
+##################
+
+die() {
+	echo $@ >&2
+	exit 1
+}
+
+screen_start() {
+	if "$SCREEN" -ls | grep -Pq "^\s+\d+\.$SCREENNAME"; then
+		die "screen named \"$SCREENNAME\" already exists. Exiting."
+	fi
+	mkdir -p "$TMPDIRP"
+	TMPDIR=$(mktemp -d minecraft-server.$$.XXXXXXXX "--tmpdir=$TMPDIRP")
+	PIPE0IN="$TMPDIR/screen0.0"
+	PIPE0OUT="$TMPDIR/screen0.1"
+	mkfifo "$PIPE0IN"
+	mkfifo "$PIPE0OUT"
+	"$SCREEN" -dmS "$SCREENNAME" -t minecraft-server bash -c "cat $PIPE0OUT & cat >$PIPE0IN" -X eval "zombie xr"
+	exec 3<&0 4>&1 0<"$PIPE0IN" 1>"$PIPE0OUT"
+}
+
+mc_start_all() {
+	for conffile in $CONFDIR/*.conf; do
+		echo "Reading $conffile"
+		(
+			. "$conffile"
+			[ -d "$DIRECTORY" ] || die "Directory \"$DIRECTORY\" specified in $conffile does not exist."
+			MCCMD="java -Xmx${MAXHEAP}M -Xms${MINHEAP}M -jar \"${PROGRAM}\" $OPTIONS"
+			SRVCMD="bash -c '{ cd \"$DIRECTORY\"; $MCCMD; }'"
+			"$SCREEN" -S "$SCREENNAME" -X eval "screen -t $WINDOWNAME $WINDOWNUMBER $SRVCMD"
+			if [ "$?" = 0 ]; then
+				echo "Started \"$WINDOWNAME\" in window $WINDOWNUMBER"
+			else
+				echo "Failed to start \"$WINDOWNAME\""
+			fi
+		)
+	done
+}
+
+mc_saveoff() {
+	WINDOW=$1
+	"$SCREEN" -S "$SCREENNAME" -p "$WINDOW" -X stuff "say SERVER BACKUP STARTING. Server going readonly...\015save-off\015save-all\015"
+}
+
+mc_saveon() {
+	WINDOW=$1
+	"$SCREEN" -S "$SCREENNAME" -p "$WINDOW" -X stuff "save-on\015say SERVER BACKUP FINISHED.\015"
+}
+
+mc_expire_backups() {
+	echo "Cleaning backup directory"
+	for snar in $(find ${BACKUPDIR} -maxdepth 1 -type f -name *_L0_*.snar -mtime $LEVEL0RETENTIONDAYS); do
+		SNAME=$(basename "$snar")
+		NOEXT=${SNAME%.snar}
+		WINDOWNAME=${NOEXT%_L0_??????????????}
+		DATESTAMP=${NOEXT#${WINDOWNAME}_L0_}
+		rm -f -v ${BACKUPDIR}/$WINDOWNAME_$DATESTAMP.tar.gz $snar
+	done
+	for snar in $(find ${BACKUPDIR} -maxdepth 1 -type f -name *_L1_*.snar -mtime $LEVEL1RETENTIONDAYS); do
+		SNAME=$(basename "$snar")
+		NOEXT=${SNAME%.snar}
+		WINDOWNAME=${NOEXT%_L1_??????????????}
+		DATESTAMP=${NOEXT#${WINDOWNAME}_L1_}
+		rm -f -v ${BACKUPDIR}/$WINDOWNAME_$DATESTAMP.tar.gz $snar
+	done
+
+}
+mc_backup_all() {
+	echo "Running backup"
+	mkdir -p "$BACKUPDIR"
+	DATESTAMP=$(date +%Y%m%d%H%M%S)
+	for conffile in $CONFDIR/*.conf; do
+		echo "Freezing server defined in $conffile"
+		(
+			. "$conffile"
+			mc_saveoff $WINDOWNAME
+		)
+	done
+	sync
+	sleep 10
+	for conffile in $CONFDIR/*.conf; do
+		echo "Backing up server defined in $conffile"
+		(
+			. "$conffile"
+			LEVELNAME=$(grep -Po '(?<=^level-name=).*' $DIRECTORY/server.properties)
+			if [ "$LEVELNAME" = "" ]; then
+				LEVELNAME=world
+			fi
+			SDIRNAME=$(basename "$DIRECTORY")
+			cd "$DIRECTORY/.."
+
+			BACKUPLEVEL=0
+			COUNT=0
+			SNARLINK0="${BACKUPDIR}/${WINDOWNAME}_L0.snar"
+			SNARLINK1="${BACKUPDIR}/${WINDOWNAME}_L1.snar"
+			if [ -L "$SNARLINK0" ]; then
+				SNAR0=$(readlink "$SNARLINK0")
+				if [ -L "$SNARLINK1" ]; then
+					SNAR1=$(readlink "$SNARLINK1")
+					LEADER=${SNAR1%_*}
+					COUNT=${LEADER##*.}
+					if [ "$COUNT" -lt "$DIFFERENTIALS" ]; then
+						COUNT=$(expr $COUNT + 1)
+						BACKUPLEVEL=1
+					else
+						rm -f "$SNARLINK1"
+					fi
+				else
+					COUNT=1
+					BACKUPLEVEL=1
+				fi
+			fi
+			if [ "$BACKUPLEVEL" -eq "0" ]; then	
+				# Level 0 backup
+				SNAR="${BACKUPDIR}/${WINDOWNAME}_L0_${DATESTAMP}.snar"
+				ln -sf "$SNAR" "$SNARLINK0"
+			else
+				# Level 1 backup (differential)
+				SNAR="${BACKUPDIR}/${WINDOWNAME}_L1.${COUNT}_${DATESTAMP}.snar"
+				cp -f "$SNAR0" "$SNAR"
+				ln -sf "$SNAR" "$SNARLINK1"
+			fi
+			find "$SDIRNAME" ! -type d -maxdepth 1 | xargs \
+			tar -czf "${BACKUPDIR}/${WINDOWNAME}_${DATESTAMP}.tar.gz" --listed-incremental="$SNAR" --exclude='*.tar' --exclude='*.zip' --exclude='*.jar' --exclude='*.gz' --exclude='*.tgz' "$SDIRNAME/$LEVELNAME"
+			echo "Unfreezing server defined in $conffile"
+			mc_saveon $WINDOWNAME
+		)
+	done
+}
+
+daemon_start() {
+	screen_start
+	echo "Daemon started"
+	mc_start_all
+}
+
+
+quit() {
+	echo "Quitting..."
+	exec 0<&- 1>&-
+	if [ -d "$TMPDIR" ]; then
+		rm -Rf "$TMPDIR" >/dev/null
+	fi
+	"$SCREEN" -S "$SCREENNAME" -X quit
+	exit 0;
+}
+
+trap quit INT TERM
+trap mc_backup_all USR1
+trap mc_expire_backups USR2
+
+daemon_start
+
+{
+	while read cmd; do
+		echo "CMD was: $cmd"
+		if [ "$cmd" = "backup" ]; then
+			mc_backup_all
+		fi
+	done
+}
+
+quit
+
