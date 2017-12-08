@@ -1,8 +1,11 @@
 #!/usr/bin/sh
+# We use the bourne shell (not full-featured bash)
+# In particular signal trap behaviour during read is affected
+
 CONFDIR=~/minecraft/servers.d
 TMPDIRP=~/minecraft/tmp
 BACKUPDIR=~/minecraft/backups
-DIFFERENTIALS=167
+DIFFERENTIALS=23
 SCREENNAME=minecraft-server
 LEVEL0RETENTIONDAYS=366
 LEVEL1RETENTIONDAYS=90
@@ -20,6 +23,26 @@ SCREEN=screen
 die() {
 	echo $@ >&2
 	exit 1
+}
+
+datestamp_to_unix() {
+# Converts +%Y%m%d%H%M%S formatted dates to epoch seconds
+	local ds YEAR MONTH DAY HOUR MINUTE SECOND
+	ds=$1
+	YEAR=${ds:0:4}
+	MONTH=${ds:4:2}
+	DAY=${ds:6:2}
+	HOUR=${ds:8:2}
+	MINUTE=${ds:10:2}
+	SECOND=${ds:12:2}
+	date -d"$YEAR-$MONTH-$DAY $HOUR:$MINUTE:$SECOND" +%s
+}
+
+age_of_file() {
+# Return age of a file, in days, rounding down. (23 hours is 0 days)
+	local path="$1"
+	expr \( $(date +%s) - $(stat -c %Y "$path") \) / 60 / 60 / 24
+	
 }
 
 screen_start() {
@@ -54,38 +77,134 @@ mc_start_all() {
 	done
 }
 
+mc_stop_all() {
+	for conffile in $CONFDIR/*.conf; do
+		echo "Reading $conffile"
+		(
+			. "$conffile"
+			"$SCREEN" -S "$SCREENNAME" -p "$WINDOWNAME" -X stuff "say SERVER SHUTTING DOWN.\015save-off\015save-all\015stop\015"
+		)
+	done
+}
+
 mc_saveoff() {
 	WINDOW=$1
 	"$SCREEN" -S "$SCREENNAME" -p "$WINDOW" -X stuff "say SERVER BACKUP STARTING. Server going readonly...\015save-off\015save-all\015"
+	CODE=$?
+	if [ "$CODE" -ne 0 ]; then
+		echo "WARN: Screen command exited with status $CODE"
+	fi
 }
 
 mc_saveon() {
 	WINDOW=$1
 	"$SCREEN" -S "$SCREENNAME" -p "$WINDOW" -X stuff "save-on\015say SERVER BACKUP FINISHED.\015"
+	CODE=$?
+	if [ "$CODE" -ne 0 ]; then
+		echo "WARN: Screen command exited with status $CODE"
+	fi
 }
 
 mc_expire_backups() {
 	echo "Cleaning backup directory"
-	for snar in $(find ${BACKUPDIR} -maxdepth 1 -type f -name *_L0_*.snar -mtime $LEVEL0RETENTIONDAYS); do
-		SNAME=$(basename "$snar")
-		NOEXT=${SNAME%.snar}
-		WINDOWNAME=${NOEXT%_L0_??????????????}
-		DATESTAMP=${NOEXT#${WINDOWNAME}_L0_}
-		rm -f -v ${BACKUPDIR}/$WINDOWNAME_$DATESTAMP.tar.gz $snar
-	done
-	for snar in $(find ${BACKUPDIR} -maxdepth 1 -type f -name *_L1_*.snar -mtime $LEVEL1RETENTIONDAYS); do
-		SNAME=$(basename "$snar")
-		NOEXT=${SNAME%.snar}
-		WINDOWNAME=${NOEXT%_L1_??????????????}
-		DATESTAMP=${NOEXT#${WINDOWNAME}_L1_}
-		rm -f -v ${BACKUPDIR}/$WINDOWNAME_$DATESTAMP.tar.gz $snar
-	done
+	for conffile in $CONFDIR/*.conf; do
+		echo "Cleaning backups for server defined in $conffile"
+		(
+			. "$conffile"
 
+			# Determine current backup set
+			declare -a EXCLUDES
+
+			# Exclude tarball that is currently symlinked as most recent L0
+			if [ -L "${BACKUPDIR}/${WINDOWNAME}_L0.tar.gz" -a -e "${BACKUPDIR}/${WINDOWNAME}_L0.tar.gz" ]; then
+				CURRENT_L0_BY_LINK=$(basename $(readlink "${BACKUPDIR}/${WINDOWNAME}_L0.tar.gz"))
+				EXCLUDES+=("$CURRENT_L0_BY_LINK")
+			fi
+
+			# Exclude L0 tarball that has the most recent DATESTAMP in its name 
+			FIND_L0=$(find ${BACKUPDIR} -maxdepth 1 -type f -name "${WINDOWNAME}_L0_*.tar.gz" -printf "%P %T@\n")
+			CURRENT_L0_BY_NAME=$(sort -rnk1 <<<"$FIND_L0" | head -n1 | awk '{print $1}')
+			if [ -n "$CURRENT_L0_BY_NAME" ]; then
+				EXCLUDES+=("$CURRENT_L0_BY_NAME")
+			fi
+
+			# Exclude L0 tarball that has the most recent modification time
+			CURRENT_L0_BY_MTIME=$(sort -rnk2 <<<"$FIND_L0" | head -n1 | awk '{print $1}')
+			if [ -n "$CURRENT_L0_BY_MTIME" ]; then
+				EXCLUDES+=("$CURRENT_L0_BY_MTIME")
+			fi
+			
+			# Exclude tarball that is currently symlinked as most recent L1
+			if [ -L "${BACKUPDIR}/${WINDOWNAME}_L1.tar.gz" -a -e "${BACKUPDIR}/${WINDOWNAME}_L1.tar.gz" ]; then
+				CURRENT_L1_BY_LINK=$(basename $(readlink "${BACKUPDIR}/${WINDOWNAME}_L1.tar.gz"))
+				EXCLUDES+=("$CURRENT_L1_BY_LINK")
+			fi
+
+			# Exclude L1 tarball that has the most recent DATESTAMP in its name
+			FIND_L1=$(find ${BACKUPDIR} -maxdepth 1 -type f -name "${WINDOWNAME}_L1.*.tar.gz" -printf "%P %T@\n")
+			CURRENT_L1_BY_NAME=$(sort -rnk1 <<<"$FIND_L1" | head -n1 | awk '{print $1}')
+			if [ -n "$CURRENT_L1_BY_NAME" ]; then
+                                EXCLUDES+=("$CURRENT_L1_BY_NAME")
+                        fi
+
+			# Exclude L1 tarball that has the most recent modification time
+			CURRENT_L1_BY_MTIME=$(sort -rnk2 <<<"$FIND_L1" | head -n1 | awk '{print $1}')
+                        if [ -n "$CURRENT_L1_BY_MTIME" ]; then
+                                EXCLUDES+=("$CURRENT_L1_BY_MTIME")
+                        fi
+
+			# Exclude any tarball that has the most recent DATESTAMP in its name
+			FIND_ANY=$(find ${BACKUPDIR} -maxdepth 1 -type f -name "${WINDOWNAME}_*.tar.gz" -printf "%P %T@\n")
+			CURRENT_ANY_BY_NAME=$(sort -rnk1 <<<"$FIND_ANY" | head -n1 | awk '{print $1}')
+                        if [ -n "$CURRENT_ANY_BY_NAME" ]; then
+                                EXCLUDES+=("$CURRENT_ANY_BY_NAME")
+                        fi
+
+			# Exclude any tarball that has the most recent modification time
+                        CURRENT_ANY_BY_MTIME=$(sort -rnk2 <<<"$FIND_ANY" | head -n1 | awk '{print $1}')
+                        if [ -n "$CURRENT_ANY_BY_MTIME" ]; then
+                                EXCLUDES+=("$CURRENT_ANY_BY_MTIME")
+                        fi
+
+                        # Exclude snar that is currently symlinked as most recent L0 snar
+                        if [ -L "${BACKUPDIR}/${WINDOWNAME}_L0.snar" -a -e "${BACKUPDIR}/${WINDOWNAME}_L0.snar" ]; then
+                                CURRENT_L0_SNAR_BY_LINK=$(basename $(readlink "${BACKUPDIR}/${WINDOWNAME}_L0.snar"))
+                                EXCLUDES+=("$CURRENT_L0_SNAR_BY_LINK")
+                        fi
+
+                        # Exclude L0 snar that has the most recent DATESTAMP in its name 
+                        FIND_L0_SNAR=$(find ${BACKUPDIR} -maxdepth 1 -type f -name "${WINDOWNAME}_L0_*.snar" -printf "%P %T@\n")
+                        CURRENT_L0_SNAR_BY_NAME=$(sort -rnk1 <<<"$FIND_L0_SNAR" | head -n1 | awk '{print $1}')
+                        if [ -n "$CURRENT_L0_SNAR_BY_NAME" ]; then
+                                EXCLUDES+=("$CURRENT_L0_SNAR_BY_NAME")
+                        fi
+
+                        # Exclude L0 snar that has the most recent modification time
+                        CURRENT_L0_SNAR_BY_MTIME=$(sort -rnk2 <<<"$FIND_L0_SNAR" | head -n1 | awk '{print $1}')
+                        if [ -n "$CURRENT_L0_SNAR_BY_MTIME" ]; then
+                                EXCLUDES+=("$CURRENT_L0_SNAR_BY_MTIME")
+                        fi
+
+
+			EXCLUDESTRING=""
+			for IGNOREFILE in "${EXCLUDES[@]}"; do
+				EXCLUDESTRING="$EXCLUDESTRING ! -name $IGNOREFILE"
+			done
+			FINDCMD_TAR_L1="find \"${BACKUPDIR}\" -maxdepth 1 -type f \( -mtime +$LEVEL1RETENTIONDAYS -name \"${WINDOWNAME}_L1.*.tar.gz\""
+			FINDCMD_TAR_REST="find \"${BACKUPDIR}\" -maxdepth 1 -type f \( -mtime +$LEVEL0RETENTIONDAYS -name \"${WINDOWNAME}_*.tar.gz\""
+			FINDCMD_SNAR_REST="find \"${BACKUPDIR}\" -maxdepth 1 -type f \( -mtime +$LEVEL0RETENTIONDAYS -name \"${WINDOWNAME}_*.snar\""
+			eval $FINDCMD_TAR_L1" \) -printf \"Purging %P\\n\" -delete"
+			eval $FINDCMD_TAR_REST" \) -printf \"Purging %P\\n\" -delete"
+			eval $FINDCMD_SNAR_REST" \) -printf \"Purging %P\\n\" -delete"
+		)
+	done
 }
+
 mc_backup_all() {
 	echo "Running backup"
 	mkdir -p "$BACKUPDIR"
 	DATESTAMP=$(date +%Y%m%d%H%M%S)
+	NOW_UNIX=$(datestamp_to_unix $DATESTAMP)
 	for conffile in $CONFDIR/*.conf; do
 		echo "Freezing server defined in $conffile"
 		(
@@ -100,7 +219,7 @@ mc_backup_all() {
 		(
 			. "$conffile"
 			LEVELNAME=$(grep -Po '(?<=^level-name=).*' $DIRECTORY/server.properties)
-			if [ "$LEVELNAME" = "" ]; then
+			if [ -z "$LEVELNAME" ]; then
 				LEVELNAME=world
 			fi
 			SDIRNAME=$(basename "$DIRECTORY")
@@ -109,36 +228,80 @@ mc_backup_all() {
 			BACKUPLEVEL=0
 			COUNT=0
 			SNARLINK0="${BACKUPDIR}/${WINDOWNAME}_L0.snar"
-			SNARLINK1="${BACKUPDIR}/${WINDOWNAME}_L1.snar"
-			if [ -L "$SNARLINK0" ]; then
+			TARLINK0="${BACKUPDIR}/${WINDOWNAME}_L0.tar.gz"
+			TARLINK1="${BACKUPDIR}/${WINDOWNAME}_L1.tar.gz"
+			if [ -L "$SNARLINK0" -a -e "$SNARLINK0" ]; then
+				# There is an extant Level-0 backup snar
 				SNAR0=$(readlink "$SNARLINK0")
-				if [ -L "$SNARLINK1" ]; then
-					SNAR1=$(readlink "$SNARLINK1")
-					LEADER=${SNAR1%_*}
-					COUNT=${LEADER##*.}
-					if [ "$COUNT" -lt "$DIFFERENTIALS" ]; then
-						COUNT=$(expr $COUNT + 1)
-						BACKUPLEVEL=1
+				SNAME=$(basename "$SNAR0")
+				NOEXT=${SNAME%.snar}
+				SNAR0_DATESTAMP=${NOEXT##*_}
+				SNAR0_MTIME_AGE=$(age_of_file $SNAR0)
+			fi
+			if [ -L "$TARLINK0" -a -e "$TARLINK0" ]; then
+				# There is an extant Level-0 backup tar
+				TAR0=$(readlink "$TARLINK0")
+				SNAME=$(basename "$TAR0")
+				NOEXT=${SNAME%.tar.gz}
+				TAR0_DATESTAMP=${NOEXT##*_}
+				TAR0_MTIME_AGE=$(age_of_file $TAR0)
+			fi
+			if [ -n "$SNAR0_DATESTAMP" -a "$SNAR0_DATESTAMP" = "$TAR0_DATESTAMP" ]; then
+				# Level 0 appears to be valid
+				DS_AGE=$(expr \( $(datestamp_to_unix $SNAR0_DATESTAMP) - $NOW_UNIX \) / 60 / 60 / 24)
+				if [ $DS_AGE -lt $LEVEL0RETENTIONDAYS -a \
+				     $DS_AGE -lt $LEVEL1RETENTIONDAYS -a \
+				     $TAR0_MTIME_AGE -lt $LEVEL0RETENTIONDAYS -a \
+				     $TAR0_MTIME_AGE -lt $LEVEL1RETENTIONDAYS -a \
+				     $SNAR0_MTIME_AGE -lt $LEVEL0RETENTIONDAYS -a \
+				     $SNAR0_MTIME_AGE -lt $LEVEL1RETENTIONDAYS ]; then
+					# Level 0 is still current
+					# So we will try to make an L1
+					if [ -L "$TARLINK1" ]; then
+						if [ -e "$TARLINK1" ]; then
+							# There is an extant Level-1
+							TAR1=$(readlink "$TARLINK1")
+							LEADER=${TAR1%_*}
+							COUNT=${LEADER##*.}
+							if [ "$COUNT" -lt "$DIFFERENTIALS" ]; then
+								COUNT=$(expr $COUNT + 1)
+								BACKUPLEVEL=1
+							fi
+						else
+							# remove dangling symlink
+							rm -f "$TARLINK1"
+						fi
 					else
-						rm -f "$SNARLINK1"
+						COUNT=1
+						BACKUPLEVEL=1
 					fi
-				else
-					COUNT=1
-					BACKUPLEVEL=1
 				fi
 			fi
 			if [ "$BACKUPLEVEL" -eq "0" ]; then	
 				# Level 0 backup
+				TAR="${BACKUPDIR}/${WINDOWNAME}_L0_${DATESTAMP}.tar.gz"
 				SNAR="${BACKUPDIR}/${WINDOWNAME}_L0_${DATESTAMP}.snar"
 				ln -sf "$SNAR" "$SNARLINK0"
 			else
 				# Level 1 backup (differential)
+				TAR="${BACKUPDIR}/${WINDOWNAME}_L1.${COUNT}_${DATESTAMP}.tar.gz"
 				SNAR="${BACKUPDIR}/${WINDOWNAME}_L1.${COUNT}_${DATESTAMP}.snar"
 				cp -f "$SNAR0" "$SNAR"
-				ln -sf "$SNAR" "$SNARLINK1"
 			fi
-			find "$SDIRNAME" ! -type d -maxdepth 1 | xargs \
-			tar -czf "${BACKUPDIR}/${WINDOWNAME}_${DATESTAMP}.tar.gz" --listed-incremental="$SNAR" --exclude='*.tar' --exclude='*.zip' --exclude='*.jar' --exclude='*.gz' --exclude='*.tgz' "$SDIRNAME/$LEVELNAME"
+			
+			find "$SDIRNAME" -maxdepth 1 ! -type d | xargs \
+			tar -czf "$TAR" --listed-incremental="$SNAR" --exclude='*.tar' --exclude='*.zip' --exclude='*.jar' --exclude='*.gz' --exclude='*.tgz' "$SDIRNAME/$LEVELNAME"
+			if [ "$?" -eq "0" ]; then
+				if [ "$BACKUPLEVEL" -eq "0" ]; then
+					ln -sf "$TAR" "$TARLINK0"
+					# Remove old L1 symlink since we have a new L0
+					rm -f "$TARLINK1"
+				else
+					ln -sf "$TAR" "$TARLINK1"
+					# SNAR from L1 does not need to be retained after creation
+					rm -f "$SNAR"
+				fi
+			fi
 			echo "Unfreezing server defined in $conffile"
 			mc_saveon $WINDOWNAME
 		)
@@ -154,28 +317,96 @@ daemon_start() {
 
 quit() {
 	echo "Quitting..."
+	mc_stop_all
+	sleep 5
 	exec 0<&- 1>&-
 	if [ -d "$TMPDIR" ]; then
 		rm -Rf "$TMPDIR" >/dev/null
 	fi
 	"$SCREEN" -S "$SCREENNAME" -X quit
-	exit 0;
+	exit 0
 }
 
-trap quit INT TERM
-trap mc_backup_all USR1
-trap mc_expire_backups USR2
+
+signal_int() {
+	SIGNAL=INT
+	echo "Signal INT"
+	quit
+}
+
+signal_term() {
+	SIGNAL=TERM
+	echo "Signal TERM"
+	quit
+}
+
+signal_usr1() {
+	SIGNAL=USR1
+	echo "Signal USR1"
+	mc_backup_all
+}
+
+signal_usr2() {
+	SIGNAL=USR2
+	echo "Signal USR2"
+	mc_expire_backups
+}
+
+trap signal_int INT
+trap signal_term TERM
+trap signal_usr1 USR1
+trap signal_usr2 USR2
 
 daemon_start
 
+mc_help() {
+	echo Possible commands are:
+	echo "backup"
+	echo "help"
+	echo "purge"
+	echo "shutdown"
+}
+
+
+# Initialize the SIGNAL flag to "no signal"
+SIGNAL=""
+
+# MAIN Command loop:
 {
-	while read cmd; do
-		echo "CMD was: $cmd"
-		if [ "$cmd" = "backup" ]; then
-			mc_backup_all
+	echo
+	mc_help
+	while true; do
+		echo
+		echo -n "> "
+		read cmd
+		CODE=$?
+		if [ -n "$SIGNAL" ]; then
+			# a signal handler ran... ignore this input line and clear the flag
+			SIGNAL=""
+		else
+			if [ $CODE -gt 128 ]; then
+				#probably read failed during signal handling
+				#this shouldn't happen
+				:
+			elif [ $CODE -eq 1 ]; then
+				echo "EOF"
+				quit
+			elif [ $CODE -eq 0 ]; then
+				if [ "$cmd" = "backup" ]; then
+					mc_backup_all
+				elif [ "$cmd" = "purge" ]; then
+					mc_expire_backups
+				elif [ "$cmd" = "help" ]; then
+					mc_help
+				elif [ "$cmd" = "shutdown" ]; then
+					quit
+				else
+					echo "Unknown command: \"$cmd\""
+					echo "(enter \"help\" for help)"
+				fi
+			fi
 		fi
 	done
 }
 
 quit
-
